@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# Swift and Xcode
+.build/
+.swiftpm/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcuserstate
+
+# Local build output
+build/
+build.noindex/
+
+# Local configuration and signing material
+.env
+.env.*
+!.env.example
+*.p12
+*.mobileprovision
