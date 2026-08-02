@@ -1,32 +1,29 @@
 import AppKit
 
-// A small floating toast shown at the selection that confirms the grab — a
-// thumbnail of the captured region plus a preview of the recognized text.
-// Non-activating, so it never steals focus from whatever you're working in.
+// A small floating toast shown at the selection that confirms the grab.
+//
+// It deliberately never shows the captured pixels: the whole point of TextGrab
+// is that you get text, not a screenshot, so putting a thumbnail of what you
+// just grabbed on screen defeats it. Non-activating, so it never steals focus.
+//
+// Turn it off entirely with "Show Confirmation" in the menu.
 enum HUD {
     private static var panel: NSPanel?
     private static var hideWork: DispatchWorkItem?
 
-    static func show(success: Bool, text: String, image: NSImage? = nil) {
-        DispatchQueue.main.async { present(success: success, text: text, image: image) }
+    static func show(success: Bool, text: String) {
+        DispatchQueue.main.async { present(success: success, text: text) }
     }
 
-    private static func present(success: Bool, text: String, image: NSImage?) {
+    private static func present(success: Bool, text: String) {
         hideWork?.cancel()
 
-        // Leading view: a thumbnail of exactly what was grabbed, or a status glyph.
-        let leading: NSView
-        if success, let image = image {
-            leading = thumbnail(image)
-        } else {
-            let icon = NSImageView()
-            icon.image = NSImage(systemSymbolName: success ? "checkmark.circle.fill" : "xmark.circle.fill",
-                                 accessibilityDescription: nil)
-            icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 24, weight: .semibold)
-            icon.contentTintColor = success ? .systemGreen : .systemOrange
-            icon.setContentHuggingPriority(.required, for: .horizontal)
-            leading = icon
-        }
+        let leading = NSImageView()
+        leading.image = NSImage(systemSymbolName: success ? "checkmark.circle.fill" : "xmark.circle.fill",
+                                accessibilityDescription: nil)
+        leading.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 24, weight: .semibold)
+        leading.contentTintColor = success ? .systemGreen : .systemOrange
+        leading.setContentHuggingPriority(.required, for: .horizontal)
 
         let title = NSTextField(labelWithString: success ? "Copied to clipboard" : "No text found")
         title.font = .systemFont(ofSize: 13, weight: .semibold)
@@ -116,30 +113,6 @@ enum HUD {
         panel.ignoresMouseEvents = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         return panel
-    }
-
-    // A rounded thumbnail of the captured region, scaled to fit a small box.
-    private static func thumbnail(_ image: NSImage) -> NSView {
-        let maxW: CGFloat = 132, maxH: CGFloat = 84
-        let s = image.size
-        let scale = min(maxW / max(s.width, 1), maxH / max(s.height, 1), 1)
-        let w = max(1, s.width * scale), h = max(1, s.height * scale)
-
-        let view = NSImageView()
-        view.image = image
-        view.imageScaling = .scaleProportionallyUpOrDown
-        view.wantsLayer = true
-        view.layer?.cornerRadius = 6
-        view.layer?.masksToBounds = true
-        view.layer?.borderWidth = 1
-        view.layer?.borderColor = NSColor.separatorColor.cgColor
-        view.setContentHuggingPriority(.required, for: .horizontal)
-        view.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            view.widthAnchor.constraint(equalToConstant: w),
-            view.heightAnchor.constraint(equalToConstant: h),
-        ])
-        return view
     }
 
     private static func snippet(_ text: String) -> String {

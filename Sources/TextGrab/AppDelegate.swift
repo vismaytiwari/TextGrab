@@ -6,6 +6,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var hotKey: GlobalHotKey?
     private var loginItem: NSMenuItem!
+    private var confirmationItem: NSMenuItem!
+    private var codeModeItem: NSMenuItem!
+
+    /// Whether anything is shown on screen after a grab. Off by default: the
+    /// point of the app is that text lands on the clipboard and nothing else
+    /// happens. Turn it on from the menu if you want the confirmation back.
+    private static let showConfirmationKey = "ShowConfirmation"
+    private var showConfirmation: Bool {
+        UserDefaults.standard.object(forKey: Self.showConfirmationKey) as? Bool ?? false
+    }
+
+    /// Tuned for code: no language correction, indentation preserved, punctuation
+    /// left as ASCII. Turn it off for prose, where correction genuinely helps.
+    private static let codeModeKey = "CodeMode"
+    private var codeMode: Bool {
+        UserDefaults.standard.object(forKey: Self.codeModeKey) as? Bool ?? true
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -19,6 +36,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(withTitle: "Grab Text  (⇧⌘2)", action: #selector(grab), keyEquivalent: "")
         menu.addItem(.separator())
+        codeModeItem = NSMenuItem(title: "Code Mode", action: #selector(toggleCodeMode), keyEquivalent: "")
+        menu.addItem(codeModeItem)
+        confirmationItem = NSMenuItem(title: "Show Confirmation",
+                                      action: #selector(toggleConfirmation), keyEquivalent: "")
+        menu.addItem(confirmationItem)
         loginItem = NSMenuItem(title: "Launch at Login",
                                action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         menu.addItem(loginItem)
@@ -31,6 +53,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         statusItem.menu = menu
         refreshLoginItemState()
+        confirmationItem.state = showConfirmation ? .on : .off
+        codeModeItem.state = codeMode ? .on : .off
 
         // ⇧⌘2 — free by default (macOS uses ⇧⌘3/4/5 for screenshots).
         hotKey = GlobalHotKey(keyCode: UInt32(kVK_ANSI_2),
@@ -44,16 +68,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func grab() {
         // Small delay lets the status menu (if open) dismiss before capture.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            switch TextGrabber.captureAndCopy() {
-            case .copied(let text, let image):
-                HUD.show(success: true, text: text, image: image)
-            case .empty:
-                HUD.show(success: false, text: "", image: nil)
-            case .cancelled:
-                break
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            // Off the main thread: the capture blocks for as long as you take to
+            // drag the selection, and the OCR for a while after that. Doing both
+            // on the main thread froze the menu bar for the whole grab.
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result = TextGrabber.captureAndCopy(codeMode: self?.codeMode ?? true)
+                DispatchQueue.main.async {
+                    switch result {
+                    case .copied(let text):
+                        if self?.showConfirmation ?? false {
+                            HUD.show(success: true, text: text)
+                        }
+                    case .empty:
+                        // Silent too, when confirmations are off. Note the
+                        // clipboard is left untouched in this case, so a paste
+                        // will produce whatever was there before.
+                        if self?.showConfirmation ?? false {
+                            HUD.show(success: false, text: "")
+                        }
+                    case .cancelled:
+                        break
+                    }
+                }
             }
         }
+    }
+
+    @objc private func toggleCodeMode() {
+        UserDefaults.standard.set(!codeMode, forKey: Self.codeModeKey)
+        codeModeItem.state = codeMode ? .on : .off
+    }
+
+    @objc private func toggleConfirmation() {
+        UserDefaults.standard.set(!showConfirmation, forKey: Self.showConfirmationKey)
+        confirmationItem.state = showConfirmation ? .on : .off
     }
 
     // MARK: Launch at Login
