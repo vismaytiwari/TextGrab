@@ -81,6 +81,29 @@ enum TextGrabber {
         }
     }
 
+    /// A menu-bar app with no windows has nowhere to put an error, and `NSLog`
+    /// from one is effectively invisible. Without this the only symptom of a
+    /// missing grant is a hot key that does nothing at all.
+    @MainActor
+    private static func presentPermissionNotice() {
+        let alert = NSAlert()
+        alert.messageText = "TextGrab needs Screen Recording"
+        alert.informativeText = """
+        macOS has just added TextGrab to System Settings › Privacy & Security › \
+        Screen Recording. Switch it on there, then quit and reopen TextGrab.
+
+        A grant does not reach an application that is already running, which is \
+        why the restart is needed.
+        """
+        alert.addButton(withTitle: "Open Settings")
+        alert.addButton(withTitle: "Later")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     /// Development tool: captures a known rectangle and reports what came back.
     /// Prints only sizes, never pixels.
     static func captureSelfTest() -> Int32 {
@@ -122,7 +145,17 @@ enum TextGrabber {
         // screen in front of it. CoreGraphics answers immediately and never
         // prompts, so it is asked before anything is drawn.
         guard CGPreflightScreenCaptureAccess() else {
-            NSLog("TextGrab: no Screen Recording permission — grant it in System Settings › Privacy & Security › Screen Recording")
+            // Preflight only READS the grant. An application is entered into the
+            // privacy database when it *requests*, so an app that only ever
+            // preflights is never listed under Screen Recording at all: no row
+            // to switch on, no prompt, and every capture failing in silence.
+            // Requesting is what registers it and raises the prompt.
+            let granted = CGRequestScreenCaptureAccess()
+            Diagnostics.log("capture blocked: no screen recording grant; requested it, granted=\(granted)")
+            // The answer is always no the first time — macOS records the grant
+            // but does not hand it to a process that has already been refused,
+            // so the app has to be restarted before it can capture.
+            DispatchQueue.main.async { presentPermissionNotice() }
             return .failed
         }
         guard let selection = RegionSelector.select(dimmed: dimmed) else { return .cancelled }
