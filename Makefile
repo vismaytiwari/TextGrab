@@ -6,7 +6,7 @@ CONTENTS_DIR := $(APP_DIR)/Contents
 MACOS_DIR := $(CONTENTS_DIR)/MacOS
 RESOURCES_DIR := $(CONTENTS_DIR)/Resources
 SOURCES := $(shell find Sources/TextGrab -name '*.swift' | sort)
-FRAMEWORKS := -framework AppKit -framework Foundation -framework Vision -framework Carbon -framework ServiceManagement
+FRAMEWORKS := -framework AppKit -framework Foundation -framework Vision -framework Carbon -framework ServiceManagement -framework ScreenCaptureKit
 # macOS ties the Screen Recording grant to the code signature, so a STABLE
 # identity is what stops the permission being forgotten on every rebuild.
 # Create it once with `make signing-cert`.

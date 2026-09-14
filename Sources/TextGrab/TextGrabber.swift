@@ -1,6 +1,13 @@
 import AppKit
-import ImageIO
+import ScreenCaptureKit
 import Vision
+
+/// Copying a picture has three outcomes, and cancelling is not an error.
+enum CopyResult {
+    case copied
+    case cancelled
+    case failed
+}
 
 enum GrabResult {
     case copied(String)  // recognized text; the pixels are discarded immediately
@@ -8,69 +15,187 @@ enum GrabResult {
     case cancelled       // user pressed Esc / made no selection
 }
 
+/// What a region capture came back with. A cancellation and a failure look the
+/// same from outside and must not be treated the same.
+private enum RegionCapture {
+    case image(CGImage)
+    case cancelled
+    case failed
+}
+
 enum TextGrabber {
-    // Shows the native screenshot-style crosshair, OCRs the selected pixels,
-    // and leaves the recognized text on the clipboard.
+    // Drags out a region, OCRs those pixels, and leaves the recognized text on
+    // the clipboard.
     static func captureAndCopy(codeMode: Bool = true) -> GrabResult {
-        // The capture goes to a private temporary file, never to the clipboard.
+        // The pixels never leave memory, and nothing but the text is ever put on
+        // the pasteboard.
         //
-        // `screencapture -c` would put the screenshot itself on the pasteboard
-        // before we replace it with the text, and that is enough for every
-        // clipboard manager — or anything syncing the clipboard to another
-        // device — to record a screenshot you never meant to take. Going via a
-        // file means the clipboard only ever sees the recognized text.
-        guard let scratch = makeScratchDirectory() else { return .cancelled }
-        defer { try? FileManager.default.removeItem(at: scratch) }
-        let file = scratch.appendingPathComponent("grab.png")
+        // `screencapture -c` used to put the screenshot itself on the pasteboard
+        // before the text replaced it, and that is all a clipboard manager — or
+        // anything syncing the clipboard to another device — needs to record a
+        // screenshot you never meant to take. Going through a private file fixed
+        // that; capturing straight to a CGImage removes even that copy.
+        switch captureRegion(dimmed: true) {
+        case .image(let image):
+            let text = recognize(image, codeMode: codeMode)
+            guard !text.isEmpty else { return .empty }
 
-        // -i interactive selection, -x no shutter sound.
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        task.arguments = ["-i", "-x", file.path]
-        do {
-            try task.run()
-            task.waitUntilExit()
-        } catch {
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            pb.setString(text, forType: .string)
+            return .copied(text)
+        case .cancelled, .failed:
+            // There is no failure case to report a failure through, and the
+            // reason is already in the log either way.
             return .cancelled
         }
-
-        // Cancelling the selection (Esc, or no drag) writes no file.
-        // Straight to a CGImage via ImageIO: no AppKit round-trip, and the raw
-        // native-resolution pixels are what Vision wants — an NSImage is measured
-        // in points and may hand back a scaled render, losing the fine detail
-        // that decides whether an `l` reads as a `1`.
-        guard task.terminationStatus == 0,
-              let source = CGImageSourceCreateWithURL(file as CFURL, nil),
-              let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil)
-        else {
-            return .cancelled
-        }
-
-        let text = recognize(cgImage, codeMode: codeMode)
-        guard !text.isEmpty else { return .empty }
-
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(text, forType: .string)
-        return .copied(text)
     }
 
-    /// A 0700 directory of our own, so the screenshot is never briefly readable
-    /// by other users the way a file dropped straight into /tmp would be.
-    private static func makeScratchDirectory() -> URL? {
-        let url = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("textgrab-\(UUID().uuidString)", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(
-                at: url,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
-            return url
-        } catch {
-            NSLog("TextGrab: could not create a scratch directory: \(error)")
+    /// Region screenshot to the clipboard, silently. Same job as macOS's own
+    /// "copy picture of selection" shortcut, minus the shutter sound, which the
+    /// system version only loses together with every other UI sound.
+    ///
+    /// Unlike a text grab, the image is meant to land on the clipboard here:
+    /// this is the path that feeds a picture to another application.
+    ///
+    /// Cancelling the selection is not a failure — Esc, a right-click or a click
+    /// with no drag leaves the clipboard alone, which is the right outcome and
+    /// should not be reported as an error.
+    static func copyRegionToClipboard() -> CopyResult {
+        switch captureRegion(dimmed: false) {
+        case .image(let image):
+            // PNG, because that is the format macOS's own screenshot copy leaves
+            // on the pasteboard and what every reader of it expects to find.
+            guard let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else {
+                NSLog("TextGrab: could not encode the captured region")
+                return .failed
+            }
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            pb.setData(png, forType: .png)
+            return .copied
+        case .cancelled:
+            return .cancelled
+        case .failed:
+            return .failed
+        }
+    }
+
+    /// Development tool: captures a known rectangle and reports what came back.
+    /// Prints only sizes, never pixels.
+    static func captureSelfTest() -> Int32 {
+        _ = NSApplication.shared
+        print("preflight granted: \(CGPreflightScreenCaptureAccess())")
+        guard let screen = NSScreen.main else {
+            print("no main screen")
+            return 1
+        }
+        // A rectangle near the top-left of the main display, in the same global
+        // bottom-left coordinates a real selection arrives in.
+        let rect = CGRect(x: screen.frame.minX + 40,
+                          y: screen.frame.maxY - 140,
+                          width: 320,
+                          height: 100)
+        print("screen \(screen.frame.integral) scale \(screen.backingScaleFactor); selecting \(rect.integral)")
+        guard let image = capture(RegionSelector.Selection(rect: rect, screen: screen)) else {
+            print("capture returned nil")
+            return 1
+        }
+        print("captured \(image.width)x\(image.height) px (expected \(Int(rect.width * screen.backingScaleFactor))x\(Int(rect.height * screen.backingScaleFactor)))")
+        let text = recognize(image, codeMode: false)
+        print("ocr found \(text.count) characters")
+        // The image path does one more thing than the text path: it encodes to
+        // PNG. Checked here without touching the pasteboard, which belongs to
+        // whoever is using the machine.
+        if let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) {
+            print("png encode ok: \(png.count) bytes")
+        } else {
+            print("png encode FAILED")
+        }
+        return 0
+    }
+
+    /// The one selector and the one capture that both hot keys go through.
+    private static func captureRegion(dimmed: Bool) -> RegionCapture {
+        // ScreenCaptureKit's first call without the grant can sit behind the
+        // system permission prompt and never come back, with an overlay left on
+        // screen in front of it. CoreGraphics answers immediately and never
+        // prompts, so it is asked before anything is drawn.
+        guard CGPreflightScreenCaptureAccess() else {
+            NSLog("TextGrab: no Screen Recording permission — grant it in System Settings › Privacy & Security › Screen Recording")
+            return .failed
+        }
+        guard let selection = RegionSelector.select(dimmed: dimmed) else { return .cancelled }
+        guard let image = capture(selection) else { return .failed }
+        return .image(image)
+    }
+
+    /// The selected points, read out of the window server as native pixels.
+    ///
+    /// The configuration is sized in pixels while a selection is in points, so
+    /// the display's scale factor is what keeps a Retina grab at full
+    /// resolution. A capture scaled down to points is where an `l` stops being
+    /// distinguishable from a `1`, which is the whole job of the app.
+    private static func capture(_ selection: RegionSelector.Selection) -> CGImage? {
+        let screen = selection.screen
+        guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+            NSLog("TextGrab: the selected screen has no display id")
             return nil
         }
+        let displayID = CGDirectDisplayID(number.uint32Value)
+        // NSScreen measures from the bottom-left corner of the whole desktop and
+        // ScreenCaptureKit from the top-left corner of the one display it is
+        // capturing, so both the origin and the direction have to be converted.
+        let source = CGRect(x: selection.rect.minX - screen.frame.minX,
+                            y: screen.frame.maxY - selection.rect.maxY,
+                            width: selection.rect.width,
+                            height: selection.rect.height)
+        let scale = screen.backingScaleFactor
+
+        var image: CGImage?
+        let done = DispatchSemaphore(value: 0)
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
+            guard let content = content,
+                  let display = content.displays.first(where: { $0.displayID == displayID }) else {
+                NSLog("TextGrab: could not find the display to capture: \(String(describing: error))")
+                done.signal()
+                return
+            }
+            // Our own windows are excluded as well as ordered out, so a
+            // confirmation toast still fading out cannot end up inside the
+            // pixels it was confirming.
+            let ours = content.windows.filter { $0.owningApplication?.processID == getpid() }
+            let filter = SCContentFilter(display: display, excludingWindows: ours)
+            let configuration = SCStreamConfiguration()
+            configuration.sourceRect = source
+            configuration.width = Int((source.width * scale).rounded())
+            configuration.height = Int((source.height * scale).rounded())
+            configuration.captureResolution = .best
+            // Both off, or the region would be letterboxed into that size
+            // instead of filling it, and the pixels would no longer line up with
+            // what was dragged.
+            configuration.scalesToFit = false
+            configuration.preservesAspectRatio = false
+            // The pointer is not part of what was selected, and a cursor baked
+            // into the image is exactly the screenshot tell being avoided here.
+            configuration.showsCursor = false
+            SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration) { captured, error in
+                if captured == nil {
+                    NSLog("TextGrab: screen capture failed: \(String(describing: error))")
+                }
+                image = captured
+                done.signal()
+            }
+        }
+        // Both callers are already on a background queue, so this waits on
+        // nothing that was not being waited on anyway. A capture that never
+        // called back would strand the thread and the hot key with it, and no
+        // screenshot has ever taken five seconds.
+        guard done.wait(timeout: .now() + 5) == .success else {
+            NSLog("TextGrab: screen capture timed out")
+            return nil
+        }
+        return image
     }
 
     static func recognize(_ image: CGImage, codeMode: Bool) -> String {
